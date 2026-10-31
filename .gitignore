@@ -1,0 +1,7 @@
+# language: text, file: .gitignore
+__pycache__/
+*.pyc
+*.db
+pdfs/
+.env
+.venv/
