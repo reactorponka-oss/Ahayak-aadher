@@ -1,3 +1,12 @@
+# bot.py top
+from health import start_health
+
+def main():
+    start_health()                       # <-- ye line add
+    if not BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN is not set")
+    app = Application.builder().token(BOT_TOKEN).build()
+    ...
 # language: Python 3.11, file: bot.py
 """
 Aadhaar Sahayak bot — English UI.
