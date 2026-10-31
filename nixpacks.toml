@@ -1,6 +1,6 @@
-# language: toml, file: nixpacks.toml
 [phases.setup]
-nixPkgs = ["python3.11", "python3.11Packages.pip", "chromium"]
+# Keep Python packages selected by the Nixpacks Python provider and add Chromium.
+nixPkgs = ["...", "chromium"]
 
 [phases.install]
 cmds = [
