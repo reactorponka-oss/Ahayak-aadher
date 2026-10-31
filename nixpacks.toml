@@ -1,9 +1,13 @@
 # language: toml, file: nixpacks.toml
 [phases.setup]
-nixPkgs = ["python311", "chromium"]
+nixPkgs = ["python3.11", "python3.11Packages.pip", "chromium"]
 
 [phases.install]
-cmds = ["pip install -r requirements.txt", "playwright install chromium"]
+cmds = [
+  "python -m pip install --upgrade pip",
+  "python -m pip install -r requirements.txt",
+  "python -m playwright install chromium"
+]
 
 [start]
 cmd = "python bot.py"
