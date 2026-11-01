@@ -1,15 +1,6 @@
-# bot.py top
-from health import start_health
-
-def main():
-    start_health()                       # <-- ye line add
-    if not BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN is not set")
-    app = Application.builder().token(BOT_TOKEN).build()
-    ...
 # language: Python 3.11, file: bot.py
 """
-Aadhaar Sahayak bot — English UI.
+Aadhaar Sahayak bot — English UI. Proxy rotation, no rate-limit.
 """
 import asyncio, os, re, time, sqlite3, uuid
 from pathlib import Path
@@ -19,16 +10,16 @@ from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
                           MessageHandler, ConversationHandler, ContextTypes, filters)
 from playwright.async_api import async_playwright
 from config import (BOT_TOKEN, BOT_USERNAME, CHANNEL_ID, CHANNEL_URL, ADMIN_ID,
-                    MAX_PER_HOUR, COOLDOWN_SEC, PDF_DIR, DB_PATH,
+                    PDF_DIR, DB_PATH, PROXY_FILE, PROXY_MAX_TRIES,
                     BOT_NAME, BRAND_LINE)
 from uidai import UidaiSession
 from captcha_solver import solve_image_captcha
+from proxy_manager import ProxyManager
 
 GATE, MENU, ASK_ID, PROCESSING, ASK_OTP_SEND, ASK_OTP_DL = range(6)
 
 Path(PDF_DIR).mkdir(exist_ok=True)
 DB = sqlite3.connect(DB_PATH, check_same_thread=False)
-DB.execute("CREATE TABLE IF NOT EXISTS rl(uid INTEGER, ts INTEGER)")
 DB.execute("CREATE TABLE IF NOT EXISTS users(uid INTEGER PRIMARY KEY, uname TEXT, first TEXT, joined INTEGER)")
 DB.execute("CREATE TABLE IF NOT EXISTS banned(uid INTEGER PRIMARY KEY, ts INTEGER)")
 DB.execute("CREATE TABLE IF NOT EXISTS stats(key TEXT PRIMARY KEY, val INTEGER)")
@@ -36,14 +27,7 @@ DB.execute("INSERT OR IGNORE INTO stats VALUES('downloads', 0)")
 DB.execute("INSERT OR IGNORE INTO stats VALUES('failures', 0)")
 DB.commit()
 
-def rate_ok(uid: int) -> bool:
-    now = int(time.time())
-    DB.execute("DELETE FROM rl WHERE ts < ?", (now - 3600,))
-    cnt, last = DB.execute("SELECT COUNT(*), MAX(ts) FROM rl WHERE uid=?", (uid,)).fetchone()
-    if cnt >= MAX_PER_HOUR: return False
-    if last and now - last < COOLDOWN_SEC: return False
-    DB.execute("INSERT INTO rl VALUES(?,?)", (uid, now)); DB.commit()
-    return True
+PM = ProxyManager(PROXY_FILE)
 
 def is_banned(uid: int) -> bool:
     return DB.execute("SELECT 1 FROM banned WHERE uid=?", (uid,)).fetchone() is not None
@@ -97,6 +81,34 @@ MENU_TEXT = (
     "<i>Use only for your own Aadhaar, or with the holder's consent.</i>"
 )
 
+async def open_with_proxy_retry(ctx: ContextTypes.DEFAULT_TYPE, by_num: bool) -> bool:
+    """Try up to PROXY_MAX_TRIES proxies. Stores sess + pw + proxy on success."""
+    pw = await async_playwright().start()
+    last_err = None
+    for attempt in range(PROXY_MAX_TRIES):
+        proxy = await PM.next()
+        if proxy is None:
+            last_err = "no proxies configured"
+            break
+        sess = UidaiSession(pw, proxy=proxy)
+        try:
+            await sess.open(by_num)
+            PM.report_ok(proxy)
+            ctx.user_data["sess"] = sess
+            ctx.user_data["pw"] = pw
+            ctx.user_data["proxy"] = proxy
+            return True
+        except Exception as e:
+            PM.report_fail(proxy)
+            last_err = str(e)
+            try: await sess.close()
+            except Exception: pass
+            continue
+    try: await pw.stop()
+    except Exception: pass
+    ctx.user_data["open_err"] = last_err or "unknown"
+    return False
+
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     track_user(update.effective_user)
     if is_banned(update.effective_user.id):
@@ -126,24 +138,16 @@ async def pick_flow(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if is_banned(q.from_user.id):
         await q.edit_message_text("🚫  You have been blocked from using this bot.")
         return ConversationHandler.END
-    if not rate_ok(q.from_user.id):
-        await q.edit_message_text(
-            "⏱️ <b>Rate limit reached</b>\n\n"
-            f"Maximum {MAX_PER_HOUR} requests per hour, with a {COOLDOWN_SEC//60}-minute cooldown.\n"
-            "Please try again later.", parse_mode=ParseMode.HTML)
-        return MENU
     by_num = q.data == "by_num"
     ctx.user_data["by_num"] = by_num
     await q.edit_message_text("⚙️  Preparing the UIDAI portal… please wait.")
-    try:
-        pw = await async_playwright().start()
-        sess = UidaiSession(pw)
-        await sess.open(by_num)
-    except Exception as e:
-        await q.edit_message_text(f"❌  Could not open UIDAI: {e}")
+    ok = await open_with_proxy_retry(ctx, by_num)
+    if not ok:
+        await q.edit_message_text(
+            f"❌  Could not reach UIDAI with any proxy.\n"
+            f"<i>{ctx.user_data.pop('open_err', '')}</i>\n\nPlease send /start to try again.",
+            parse_mode=ParseMode.HTML)
         return MENU
-    ctx.user_data["sess"] = sess
-    ctx.user_data["pw"] = pw
     if by_num:
         msg = (
             "🔢  <b>Aadhaar by Number</b>\n"
@@ -331,14 +335,15 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     total_bans  = DB.execute("SELECT COUNT(*) FROM banned").fetchone()[0]
     downloads   = DB.execute("SELECT val FROM stats WHERE key='downloads'").fetchone()[0]
     failures    = DB.execute("SELECT val FROM stats WHERE key='failures'").fetchone()[0]
+    ps = PM.stats()
     await update.message.reply_text(
         "<b>📊 Bot Statistics</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"👥  Total users: <b>{total_users}</b>\n"
         f"📥  Successful downloads: <b>{downloads}</b>\n"
         f"❌  Failures: <b>{failures}</b>\n"
-        f"🚫  Banned users: <b>{total_bans}</b>\n"
-        f"⏱️  Rate limit: {MAX_PER_HOUR}/hr, {COOLDOWN_SEC//60} min cooldown",
+        f"🚫  Banned users: <b>{total_bans}</b>\n\n"
+        f"🌐  Proxies total: <b>{ps['total']}</b> · alive: <b>{ps['alive']}</b> · dead: <b>{ps['dead']}</b>",
         parse_mode=ParseMode.HTML)
 
 @admin_only
@@ -362,13 +367,10 @@ async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
-        await update.message.reply_text("Usage: /ban <user_id>")
-        return
-    try:
-        uid = int(ctx.args[0])
+        await update.message.reply_text("Usage: /ban <user_id>"); return
+    try: uid = int(ctx.args[0])
     except ValueError:
-        await update.message.reply_text("Invalid user ID.")
-        return
+        await update.message.reply_text("Invalid user ID."); return
     DB.execute("INSERT OR IGNORE INTO banned(uid, ts) VALUES(?,?)", (uid, int(time.time())))
     DB.commit()
     await update.message.reply_text(f"🚫  User {uid} banned.")
@@ -376,13 +378,10 @@ async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
-        await update.message.reply_text("Usage: /unban <user_id>")
-        return
-    try:
-        uid = int(ctx.args[0])
+        await update.message.reply_text("Usage: /unban <user_id>"); return
+    try: uid = int(ctx.args[0])
     except ValueError:
-        await update.message.reply_text("Invalid user ID.")
-        return
+        await update.message.reply_text("Invalid user ID."); return
     DB.execute("DELETE FROM banned WHERE uid=?", (uid,)); DB.commit()
     await update.message.reply_text(f"✅  User {uid} unbanned.")
 
@@ -390,47 +389,20 @@ async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_banlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rows = DB.execute("SELECT uid FROM banned ORDER BY ts DESC LIMIT 50").fetchall()
     if not rows:
-        await update.message.reply_text("No banned users.")
-        return
+        await update.message.reply_text("No banned users."); return
     lines = "\n".join(f"• <code>{u}</code>" for (u,) in rows)
     await update.message.reply_text(f"<b>🚫 Banned users</b>\n{lines}", parse_mode=ParseMode.HTML)
+
+@admin_only
+async def cmd_proxies(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ps = PM.stats()
+    await update.message.reply_text(
+        f"<b>🌐 Proxy Pool</b>\n"
+        f"Total: {ps['total']}\nAlive: {ps['alive']}\nDead: {ps['dead']}",
+        parse_mode=ParseMode.HTML)
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"<b>{BOT_NAME}</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "/start — open the main menu\n"
-        "/cancel — abort the current download\n"
-        "/help — show this message\n\n"
-        f"<i>Bot:</i> @{BOT_USERNAME}",
-        parse_mode=ParseMode.HTML)
-
-def main():
-    if not BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN is not set")
-    app = Application.builder().token(BOT_TOKEN).build()
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            GATE:         [CallbackQueryHandler(retry, pattern="^retry$")],
-            MENU:         [CallbackQueryHandler(pick_flow, pattern="^(by_num|by_eid|cancel)$")],
-            ASK_ID:       [MessageHandler(filters.TEXT & ~filters.COMMAND, got_id)],
-            PROCESSING:   [MessageHandler(filters.TEXT & ~filters.COMMAND, got_manual_captcha)],
-            ASK_OTP_SEND: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_otp_send)],
-            ASK_OTP_DL:   [MessageHandler(filters.TEXT & ~filters.COMMAND, got_otp_dl)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
-        allow_reentry=True,
-    )
-    app.add_handler(conv)
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
-    app.add_handler(CommandHandler("ban", cmd_ban))
-    app.add_handler(CommandHandler("unban", cmd_unban))
-    app.add_handler(CommandHandler("banlist", cmd_banlist))
-    print(f"{BOT_NAME} is up.")
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
+        "/start — open the main menu\n
