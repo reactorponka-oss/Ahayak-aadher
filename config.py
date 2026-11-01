@@ -10,16 +10,19 @@ CHANNEL_URL   = "https://t.me/AADHARSAHAYAK"
 # ---- Admin ----
 ADMIN_ID      = 7197906650
 
-# ---- Rate limit ----
-MAX_PER_HOUR  = 3
-COOLDOWN_SEC  = 300
-
 # ---- Capsolver ----
 CAPSOLVER_KEY = os.getenv("CAPSOLVER_KEY", "")
 
 # ---- Paths ----
 DB_PATH       = "sessions.db"
 PDF_DIR       = "pdfs"
+PROXY_FILE    = "proxies.txt"
+
+# ---- Network / retry ----
+PROXY_MAX_TRIES   = 6          # kitne proxies try karne hain ek user request pe
+PAGE_TIMEOUT_MS   = 20000      # per navigation
+NAV_WAIT          = "domcontentloaded"
+BLOCK_RESOURCES   = True       # images/css/fonts block except captcha
 
 # ---- Branding ----
 BOT_NAME      = "Aadhaar Sahayak"
